@@ -1,0 +1,55 @@
+name: Scrape Tabanan News
+
+on:
+  schedule:
+    # 08:00 WITA (UTC+8) every day -> 00:00 UTC
+    - cron: "0 0 * * *"
+  workflow_dispatch: {}   # allows manual "Run workflow" trigger from the Actions tab
+
+permissions:
+  contents: write   # needed so the workflow can commit the CSV back to the repo
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up Chrome for Selenium
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run scraper
+        id: scrape
+        run: python tabanan_news_scraper.py
+
+      - name: Commit and push CSV output
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add output/success/ output/failed/
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "Add Tabanan news scrape $(date -u +'%Y-%m-%d %H:%M UTC')"
+            git push
+          fi
+
+      - name: Show raw file URL
+        if: always()
+        run: |
+          echo "Success CSV: https://raw.githubusercontent.com/${{ github.repository }}/${{ github.ref_name }}/${{ steps.scrape.outputs.success_csv }}"
+          echo "Failed CSV:  https://raw.githubusercontent.com/${{ github.repository }}/${{ github.ref_name }}/${{ steps.scrape.outputs.failed_csv }}"
