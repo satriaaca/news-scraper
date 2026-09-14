@@ -2,7 +2,8 @@
 Tabanan News RSS Scraper
 - feedparser  : parse RSS feed
 - Selenium    : resolve Google News redirect URLs
-- newspaper3k : download + parse full article text
+- newspaper4k : download + parse full article text
+- cloudscraper: fetch pages through Cloudflare's anti-bot challenge
 - Output      : structured CSV (raw fields, no 5W1H transformation)
 
 CSV output is committed & pushed to a GitHub repo by the accompanying
@@ -15,6 +16,7 @@ import time
 import os
 import nltk
 import feedparser
+import cloudscraper
 
 # Download required NLTK data silently
 for _pkg in ("punkt", "punkt_tab"):
@@ -22,7 +24,6 @@ for _pkg in ("punkt", "punkt_tab"):
 
 from datetime import datetime
 from newspaper import Article
-from newspaper import network as newspaper_network
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 
@@ -82,6 +83,16 @@ SUCCESS_FIELDS = [
 ]
 
 FAILED_FIELDS = ["title", "google_news_link", "reason"]
+
+REQUEST_TIMEOUT = 15
+MAX_DOWNLOAD_RETRIES = 3
+
+# cloudscraper wraps requests.Session and automatically solves Cloudflare's
+# JS/anti-bot challenge pages (the usual cause of 403s on Indonesian news
+# sites), while still behaving like a normal browser for everything else.
+SCRAPER = cloudscraper.create_scraper(
+    browser={"browser": "chrome", "platform": "windows", "mobile": False}
+)
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -168,9 +179,36 @@ def resolve_url(driver: webdriver.Chrome, google_url: str) -> str | None:
 # ── Article scraper ───────────────────────────────────────────────────────────
 
 
+def fetch_html(url: str) -> str:
+    """Download page HTML through cloudscraper (handles Cloudflare
+    JS-challenge pages automatically), retrying on non-200 responses."""
+    last_exc = None
+    for attempt in range(1, MAX_DOWNLOAD_RETRIES + 1):
+        try:
+            resp = SCRAPER.get(
+                url,
+                timeout=REQUEST_TIMEOUT,
+                headers={
+                    "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
+                    "Referer": "https://www.google.com/",
+                },
+            )
+            if resp.status_code == 200:
+                return resp.text
+            last_exc = Exception(f"HTTP {resp.status_code}")
+        except Exception as e:  # cloudscraper can raise its own exception types
+            last_exc = e
+
+        if attempt < MAX_DOWNLOAD_RETRIES:
+            time.sleep(2 * attempt)  # small backoff before retrying
+
+    raise last_exc
+
+
 def scrape_article(url: str) -> tuple[str, str]:
+    html = fetch_html(url)
     article = Article(url, language="id")
-    article.download()
+    article.set_html(html)
     article.parse()
     article.nlp()
     return article.text, article.summary
@@ -204,10 +242,6 @@ def build_success_row(entry, pub_dt: datetime, full_text: str, summary: str, res
 
 
 def main():
-    newspaper_network.USER_AGENT = (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-    )
-
     print(f"[RSS] Fetching: {RSS_URL}")
     feed = feedparser.parse(RSS_URL)
     entries = feed.entries[:MAX_RESULTS]
