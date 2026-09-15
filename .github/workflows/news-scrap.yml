@@ -3,7 +3,7 @@ name: Scrape Tabanan News
 on:
   schedule:
     # 08:00 WITA (UTC+8) every day -> 00:00 UTC
-    - cron: "0 0 * * *"
+    - cron: "0 6 * * *"
   workflow_dispatch: {}   # allows manual "Run workflow" trigger from the Actions tab
 
 permissions:
