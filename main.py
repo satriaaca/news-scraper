@@ -1,59 +1,81 @@
 """
 Tabanan News RSS Scraper
-- feedparser  : parse RSS feed
-- Selenium    : resolve Google News redirect URLs
-- newspaper4k : download + parse full article text
-- cloudscraper: fetch pages through Cloudflare's anti-bot challenge
-- Output      : structured CSV (raw fields, no 5W1H transformation)
 
-CSV output is committed & pushed to a GitHub repo by the accompanying
-GitHub Actions workflow, so it becomes reachable at a raw.githubusercontent.com URL.
+Fitur:
+- Mengambil berita dari Google News RSS
+- Selenium untuk resolve Google News redirect URL
+- newspaper4k/newspaper3k untuk mengambil isi berita
+- Membentuk data 5W1H
+- Menyimpan CSV success dan failed ke output/success/{date} dan output/failed/{date}
+- Mendukung testing lokal
+- Mendukung GitHub Actions (menulis GITHUB_OUTPUT: success_csv, failed_csv)
+
+Contoh penggunaan:
+
+    python scraper.py
+    python scraper.py --max-results 1
+    python scraper.py --max-results 5 --show-browser
+    python scraper.py --no-selenium
+    python scraper.py --rss "https://news.google.com/rss/search?q=Tabanan"
 """
 
+from __future__ import annotations
+
+import argparse
 import csv
-import re
-import time
 import os
-import nltk
-import feedparser
-import cloudscraper
-
-# Download required NLTK data silently
-for _pkg in ("punkt", "punkt_tab"):
-    nltk.download(_pkg, quiet=True)
-
+import re
+import sys
+import time
 from datetime import datetime
+from typing import Optional, Tuple
+
+import feedparser
+import nltk
+
 from newspaper import Article
+from newspaper import network as newspaper_network
+
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 
-# ── Config ────────────────────────────────────────────────────────────────────
 
-RSS_URL = (
-    "https://news.google.com/rss/search" "?q=Tabanan+when:1d&hl=id&gl=ID&ceid=ID:id"
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+DEFAULT_RSS_URL = (
+    "https://news.google.com/rss/search"
+    "?q=Tabanan+when:1d&hl=id&gl=ID&ceid=ID:id"
 )
 
-MAX_RESULTS = 40
+DEFAULT_MAX_RESULTS = 40
 
-TODAY = datetime.now().strftime("%Y-%m-%d")
-# NOTE: these paths are relative to the repo root when run from the GitHub
-# Actions workflow, so the committed CSVs land inside the repo (and therefore
-# become available via raw.githubusercontent.com once pushed).
-#
-# Flat, dated-filename layout (one file per day, no per-run timestamp folder)
-# so downstream analysis can just glob("output/success/*.csv") without
-# recursing through folders:
-#   output/success/2026-09-14.csv
-#   output/failed/2026-09-14.csv
-SUCCESS_DIR = os.path.join("output", "success")
-FAILED_DIR = os.path.join("output", "failed")
-os.makedirs(SUCCESS_DIR, exist_ok=True)
-os.makedirs(FAILED_DIR, exist_ok=True)
+ID_DAYS = {
+    0: "Senin",
+    1: "Selasa",
+    2: "Rabu",
+    3: "Kamis",
+    4: "Jumat",
+    5: "Sabtu",
+    6: "Minggu",
+}
 
-SUCCESS_CSV = os.path.join(SUCCESS_DIR, f"{TODAY}.csv")
-FAILED_CSV = os.path.join(FAILED_DIR, f"{TODAY}.csv")
+ID_MONTHS = {
+    1: "Januari",
+    2: "Februari",
+    3: "Maret",
+    4: "April",
+    5: "Mei",
+    6: "Juni",
+    7: "Juli",
+    8: "Agustus",
+    9: "September",
+    10: "Oktober",
+    11: "November",
+    12: "Desember",
+}
 
-# Fixed values
 FIXED = {
     "data_of_information": "2, 7",
     "category": "5",
@@ -61,19 +83,21 @@ FIXED = {
     "hashtags": "kejaksaan, kejatibali, kejaritabanan, tabanan, news",
     "latitude": -8.536609490935,
     "longitude": 115.13552944186335,
-    "location_name": "Dajan Peken, 82114, Tabanan, Tabanan, Bali, Indonesia",
+    "location_name": (
+        "Dajan Peken, 82114, Tabanan, Tabanan, Bali, Indonesia"
+    ),
     "where": "Kabupaten Tabanan, Bali, Indonesia",
 }
 
-# No more 5W1H fields (what/why/how) — just the raw article content + metadata.
 SUCCESS_FIELDS = [
     "title",
-    "published_date",
+    "when_",
     "where",
+    "who",
+    "what",
+    "why",
+    "how",
     "source_agent_report",
-    "url",
-    "summary",
-    "content",
     "location_name",
     "latitude",
     "longitude",
@@ -82,263 +106,842 @@ SUCCESS_FIELDS = [
     "hashtags",
 ]
 
-FAILED_FIELDS = ["title", "google_news_link", "reason"]
-
-REQUEST_TIMEOUT = 15
-MAX_DOWNLOAD_RETRIES = 3
-
-# cloudscraper wraps requests.Session and automatically solves Cloudflare's
-# JS/anti-bot challenge pages (the usual cause of 403s on Indonesian news
-# sites), while still behaving like a normal browser for everything else.
-SCRAPER = cloudscraper.create_scraper(
-    browser={"browser": "chrome", "platform": "windows", "mobile": False}
-)
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
+FAILED_FIELDS = [
+    "title",
+    "google_news_link",
+    "reason",
+]
 
 
-def clean_title(title: str) -> str:
-    """Removes source suffix after '-' and strips special characters."""
-    if "-" in title:
-        title = title.rsplit("-", 1)[0]
-    title = re.sub(r"[^a-zA-Z0-9\s]", "", title)
-    return " ".join(title.split())
+# ============================================================================
+# NLTK
+# ============================================================================
+
+def prepare_nltk() -> None:
+    """
+    Mengunduh resource NLTK yang diperlukan oleh newspaper.
+    """
+
+    packages = [
+        "punkt",
+        "punkt_tab",
+    ]
+
+    for package in packages:
+        try:
+            nltk.download(package, quiet=True)
+        except Exception as error:
+            print(
+                f"[WARNING] Gagal mengunduh NLTK resource "
+                f"{package}: {error}"
+            )
+
+
+# ============================================================================
+# TEXT HELPERS
+# ============================================================================
+
+def split_sentences(text: str) -> list[str]:
+    """
+    Memecah teks menjadi kalimat sederhana.
+    """
+
+    if not text:
+        return []
+
+    parts = re.split(
+        r"(?<=[.!?])\s+",
+        text.strip(),
+    )
+
+    return [
+        part.strip()
+        for part in parts
+        if part.strip()
+    ]
+
+
+def get_sentences(
+    text: str,
+    start: int,
+    end: int,
+) -> str:
+    """
+    Mengambil kalimat dari index start sampai end.
+    """
+
+    sentences = split_sentences(text)
+
+    return " ".join(
+        sentences[start:end]
+    )
 
 
 def extract_source_from_title(title: str) -> str:
-    """Original (uncleaned) title is needed here to find the source."""
-    match = re.search(r"-\s*([^-]+)$", title)
-    return match.group(1).strip() if match else "News"
+    """
+    Mengambil nama media dari bagian akhir judul Google News.
+
+    Contoh:
+        "Berita Tabanan Hari Ini - Bali Post"
+
+    Hasil:
+        "Bali Post"
+    """
+
+    match = re.search(
+        r"-\s*([^-]+)$",
+        title,
+    )
+
+    if match:
+        return match.group(1).strip()
+
+    return "News"
+
+
+def clean_title(title: str) -> str:
+    """
+    Membersihkan judul berita.
+
+    - Menghapus suffix media setelah tanda "-"
+    - Menghapus karakter khusus
+    - Merapikan spasi
+    """
+
+    if not title:
+        return ""
+
+    if "-" in title:
+        title = title.rsplit("-", 1)[0]
+
+    title = re.sub(
+        r"[^a-zA-Z0-9\s]",
+        "",
+        title,
+    )
+
+    return " ".join(title.split())
+
+
+def format_how_prefix(pub_dt: datetime) -> str:
+    """
+    Membuat prefix untuk kolom how.
+    """
+
+    day_name = ID_DAYS[pub_dt.weekday()]
+    month_name = ID_MONTHS[pub_dt.month]
+
+    return (
+        f"Pada Hari {day_name} , "
+        f"{pub_dt.day} {month_name} {pub_dt.year} "
+        f"{pub_dt.strftime('%H:%M')}, "
+        "Tabanan, Tabanan, Bali"
+    )
 
 
 def format_date_iso(pub_dt: datetime) -> str:
-    return pub_dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    """
+    Format tanggal seperti:
+        2026-09-16T10:20:30.123Z
+    """
+
+    return (
+        pub_dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
+        + "Z"
+    )
 
 
-def load_existing_rows(csv_path: str, fields: list) -> list:
-    """Load rows already written today (if the file exists from an earlier
-    run today), so a second run the same day can append+dedupe instead of
-    overwriting or creating a duplicate file."""
-    if not os.path.exists(csv_path):
-        return []
-    with open(csv_path, "r", newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        return [row for row in reader if row]
+# ============================================================================
+# SELENIUM
+# ============================================================================
+
+def make_driver(
+    show_browser: bool = False,
+) -> webdriver.Chrome:
+    """
+    Membuat Chrome WebDriver.
+
+    show_browser=False:
+        Chrome berjalan headless.
+
+    show_browser=True:
+        Chrome tampil secara normal untuk debugging lokal.
+    """
+
+    options = Options()
+
+    if not show_browser:
+        options.add_argument("--headless=new")
+
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--window-size=1920,1080")
+    options.add_argument("--lang=id-ID")
+
+    # User-Agent agar lebih menyerupai browser biasa.
+    options.add_argument(
+        "--user-agent="
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 "
+        "(KHTML, like Gecko) "
+        "Chrome/128.0.0.0 Safari/537.36"
+    )
+
+    try:
+        driver = webdriver.Chrome(
+            options=options,
+        )
+
+        driver.set_page_load_timeout(30)
+
+        return driver
+
+    except Exception as error:
+        raise RuntimeError(
+            "Gagal menjalankan Chrome WebDriver. "
+            "Pastikan Google Chrome sudah terinstall. "
+            f"Detail: {error}"
+        ) from error
 
 
-def dedupe_success_rows(rows: list) -> list:
-    """De-duplicate by article URL, keeping the first occurrence."""
-    seen = set()
-    deduped = []
-    for row in rows:
-        key = row.get("url")
-        if key and key in seen:
-            continue
-        if key:
-            seen.add(key)
-        deduped.append(row)
-    return deduped
+def resolve_url(
+    driver: webdriver.Chrome,
+    google_url: str,
+    wait_seconds: float = 2.0,
+) -> Optional[str]:
+    """
+    Membuka URL Google News menggunakan Selenium,
+    lalu mengambil URL artikel tujuan.
+    """
 
+    if not google_url:
+        return None
 
-def dedupe_failed_rows(rows: list) -> list:
-    """De-duplicate by google_news_link, keeping the first occurrence."""
-    seen = set()
-    deduped = []
-    for row in rows:
-        key = row.get("google_news_link")
-        if key and key in seen:
-            continue
-        if key:
-            seen.add(key)
-        deduped.append(row)
-    return deduped
-
-
-# ── Selenium URL resolver ─────────────────────────────────────────────────────
-
-
-def make_driver() -> webdriver.Chrome:
-    opts = Options()
-    opts.add_argument("--headless=new")
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--disable-gpu")
-    return webdriver.Chrome(options=opts)
-
-
-def resolve_url(driver: webdriver.Chrome, google_url: str) -> str | None:
     try:
         driver.get(google_url)
-        time.sleep(2)
-        real = driver.current_url
-        return real if "google.com" not in real else None
-    except Exception:
+
+        time.sleep(wait_seconds)
+
+        real_url = driver.current_url.strip()
+
+        if not real_url:
+            return None
+
+        # Jika masih berada di Google News, dianggap gagal.
+        if "google.com" in real_url.lower():
+            return None
+
+        return real_url
+
+    except Exception as error:
+        print(
+            f"    [WARNING] URL resolve error: {error}"
+        )
+
         return None
 
 
-# ── Article scraper ───────────────────────────────────────────────────────────
+# ============================================================================
+# ARTICLE SCRAPER
+# ============================================================================
 
+def scrape_article(
+    url: str,
+) -> Tuple[str, str]:
+    """
+    Mengambil isi artikel dan ringkasannya menggunakan newspaper.
+    """
 
-def fetch_html(url: str) -> str:
-    """Download page HTML through cloudscraper (handles Cloudflare
-    JS-challenge pages automatically), retrying on non-200 responses."""
-    last_exc = None
-    for attempt in range(1, MAX_DOWNLOAD_RETRIES + 1):
-        try:
-            resp = SCRAPER.get(
-                url,
-                timeout=REQUEST_TIMEOUT,
-                headers={
-                    "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
-                    "Referer": "https://www.google.com/",
-                },
-            )
-            if resp.status_code == 200:
-                return resp.text
-            last_exc = Exception(f"HTTP {resp.status_code}")
-        except Exception as e:  # cloudscraper can raise its own exception types
-            last_exc = e
+    article = Article(
+        url,
+        language="id",
+    )
 
-        if attempt < MAX_DOWNLOAD_RETRIES:
-            time.sleep(2 * attempt)  # small backoff before retrying
-
-    raise last_exc
-
-
-def scrape_article(url: str) -> tuple[str, str]:
-    html = fetch_html(url)
-    article = Article(url, language="id")
-    article.set_html(html)
+    article.download()
     article.parse()
-    article.nlp()
-    return article.text, article.summary
+
+    # NLP digunakan untuk menghasilkan summary.
+    try:
+        article.nlp()
+    except Exception:
+        pass
+
+    full_text = article.text or ""
+    summary = article.summary or ""
+
+    return (
+        full_text.strip(),
+        summary.strip(),
+    )
 
 
-# ── Row builder ───────────────────────────────────────────────────────────────
+# ============================================================================
+# CSV HELPERS
+# ============================================================================
+
+def create_output_paths() -> Tuple[str, str]:
+    """
+    Membuat path output untuk success dan failed:
+
+        output/success/{YYYY-MM-DD}.csv
+        output/failed/{YYYY-MM-DD}.csv
+
+    Jika file untuk tanggal yang sama sudah ada, file tersebut
+    akan ditimpa (replace) oleh run berikutnya di hari yang sama.
+    """
+
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    success_dir = os.path.join(
+        "output",
+        "success",
+    )
+
+    failed_dir = os.path.join(
+        "output",
+        "failed",
+    )
+
+    os.makedirs(
+        success_dir,
+        exist_ok=True,
+    )
+
+    os.makedirs(
+        failed_dir,
+        exist_ok=True,
+    )
+
+    success_csv = os.path.join(
+        success_dir,
+        f"{today}.csv",
+    )
+
+    failed_csv = os.path.join(
+        failed_dir,
+        f"{today}.csv",
+    )
+
+    return (
+        success_csv,
+        failed_csv,
+    )
 
 
-def build_success_row(entry, pub_dt: datetime, full_text: str, summary: str, resolved_url: str) -> dict:
-    original_title = entry.title
-    cleaned_title = clean_title(original_title)
+def write_csv(
+    filename: str,
+    fieldnames: list[str],
+    rows: list[dict],
+) -> None:
+    """
+    Menulis data ke CSV UTF-8.
+    """
+
+    with open(
+        filename,
+        "w",
+        newline="",
+        encoding="utf-8-sig",
+    ) as file:
+        writer = csv.DictWriter(
+            file,
+            fieldnames=fieldnames,
+            extrasaction="ignore",
+        )
+
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def write_github_output(
+    success_csv: str,
+    failed_csv: str,
+) -> None:
+    """
+    Menulis path CSV ke file GITHUB_OUTPUT (jika berjalan di GitHub Actions)
+    supaya bisa dipakai oleh step berikutnya, misalnya:
+
+        ${{ steps.scrape.outputs.success_csv }}
+        ${{ steps.scrape.outputs.failed_csv }}
+    """
+
+    github_output = os.environ.get("GITHUB_OUTPUT")
+
+    if not github_output:
+        return
+
+    try:
+        # Gunakan forward slash agar konsisten dengan URL raw.githubusercontent.com
+        success_posix = success_csv.replace(os.sep, "/")
+        failed_posix = failed_csv.replace(os.sep, "/")
+
+        with open(
+            github_output,
+            "a",
+            encoding="utf-8",
+        ) as file:
+            file.write(f"success_csv={success_posix}\n")
+            file.write(f"failed_csv={failed_posix}\n")
+
+    except Exception as error:
+        print(
+            f"[WARNING] Gagal menulis GITHUB_OUTPUT: {error}"
+        )
+
+
+# ============================================================================
+# ROW BUILDER
+# ============================================================================
+
+def build_success_row(
+    entry,
+    pub_dt: datetime,
+    full_text: str,
+    summary: str,
+) -> dict:
+    """
+    Membentuk satu baris data success.
+    """
+
+    original_title = entry.get(
+        "title",
+        "(no title)",
+    )
+
+    cleaned_title = clean_title(
+        original_title,
+    )
+
+    what = (
+        get_sentences(
+            full_text,
+            0,
+            2,
+        ).strip()
+        or summary.strip()
+    )
+
+    why = get_sentences(
+        full_text,
+        2,
+        4,
+    )
+
+    prefix = format_how_prefix(
+        pub_dt,
+    )
+
+    how = (
+        f"{prefix}\n\n"
+        f"{full_text.strip()}"
+    )
 
     return {
         "title": cleaned_title,
-        "published_date": format_date_iso(pub_dt),
+        "when_": format_date_iso(pub_dt),
         "where": FIXED["where"],
-        "source_agent_report": extract_source_from_title(original_title),
-        "url": resolved_url,
-        "summary": summary.strip(),
-        "content": full_text.strip(),
+        "who": original_title,
+        "what": what,
+        "why": why,
+        "how": how,
+        "source_agent_report": extract_source_from_title(
+            original_title,
+        ),
         "location_name": FIXED["location_name"],
         "latitude": FIXED["latitude"],
         "longitude": FIXED["longitude"],
         "category": FIXED["category"],
-        "data_of_information": FIXED["data_of_information"],
+        "data_of_information": FIXED[
+            "data_of_information"
+        ],
         "hashtags": FIXED["hashtags"],
     }
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ============================================================================
+# ARGUMENTS
+# ============================================================================
+
+def parse_arguments():
+    """
+    Membaca argument command line.
+    """
+
+    parser = argparse.ArgumentParser(
+        description="Tabanan News RSS Scraper",
+    )
+
+    parser.add_argument(
+        "--rss",
+        default=DEFAULT_RSS_URL,
+        help="URL RSS Google News",
+    )
+
+    parser.add_argument(
+        "--max-results",
+        type=int,
+        default=DEFAULT_MAX_RESULTS,
+        help="Jumlah maksimal artikel yang diproses",
+    )
+
+    parser.add_argument(
+        "--show-browser",
+        action="store_true",
+        help="Menampilkan Chrome saat Selenium berjalan",
+    )
+
+    parser.add_argument(
+        "--no-selenium",
+        action="store_true",
+        help=(
+            "Tidak menggunakan Selenium. "
+            "Link RSS akan digunakan langsung sebagai URL artikel."
+        ),
+    )
+
+    parser.add_argument(
+        "--delay",
+        type=float,
+        default=1.0,
+        help="Jeda antarartikel dalam detik",
+    )
+
+    return parser.parse_args()
 
 
-def main():
-    print(f"[RSS] Fetching: {RSS_URL}")
-    feed = feedparser.parse(RSS_URL)
-    entries = feed.entries[:MAX_RESULTS]
-    print(f"[RSS] Processing {len(entries)} articles.\n")
+# ============================================================================
+# MAIN
+# ============================================================================
 
-    driver = make_driver()
+def main() -> None:
+    args = parse_arguments()
+
+    if args.max_results < 1:
+        print(
+            "[ERROR] --max-results harus lebih besar dari 0."
+        )
+
+        sys.exit(1)
+
+    if args.delay < 0:
+        print(
+            "[ERROR] --delay tidak boleh negatif."
+        )
+
+        sys.exit(1)
+
+    prepare_nltk()
+
+    newspaper_network.USER_AGENT = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 "
+        "(KHTML, like Gecko) "
+        "Chrome/128.0.0.0 Safari/537.36"
+    )
+
+    success_csv, failed_csv = create_output_paths()
+
+    print("=" * 80)
+    print("TABANAN NEWS RSS SCRAPER")
+    print("=" * 80)
+    print(f"[CONFIG] RSS URL       : {args.rss}")
+    print(f"[CONFIG] Max results   : {args.max_results}")
+    print(f"[CONFIG] Selenium      : {not args.no_selenium}")
+    print(f"[CONFIG] Show browser  : {args.show_browser}")
+    print(f"[CONFIG] Delay         : {args.delay} detik")
+    print()
+
+    print(f"[RSS] Fetching: {args.rss}")
+
+    try:
+        feed = feedparser.parse(
+            args.rss,
+        )
+    except Exception as error:
+        print(
+            f"[ERROR] RSS gagal diproses: {error}"
+        )
+
+        sys.exit(1)
+
+    if getattr(feed, "bozo", False):
+        print(
+            "[WARNING] RSS memiliki kemungkinan format "
+            "yang tidak sempurna."
+        )
+
+        if getattr(feed, "bozo_exception", None):
+            print(
+                f"[WARNING] Detail RSS: "
+                f"{feed.bozo_exception}"
+            )
+
+    entries = feed.entries[:args.max_results]
+
+    if not entries:
+        print(
+            "[ERROR] Tidak ada artikel ditemukan dari RSS."
+        )
+
+        sys.exit(1)
+
+    print(
+        f"[RSS] Processing {len(entries)} articles."
+    )
+    print()
+
+    driver = None
+
     success_rows = []
     failed_rows = []
 
-    for i, entry in enumerate(entries, 1):
-        title = entry.get("title", "(no title)")
-        link = entry.get("link", "")
-        print(f"[{i}/{len(entries)}] {title[:70]}...")
+    try:
+        if not args.no_selenium:
+            print("[SELENIUM] Starting Chrome...")
 
-        try:
-            pub_dt = datetime(*entry.published_parsed[:6])
-        except Exception:
-            failed_rows.append(
-                {"title": title, "google_news_link": link, "reason": "Date error"}
+            driver = make_driver(
+                show_browser=args.show_browser,
             )
-            continue
 
-        resolved_url = resolve_url(driver, link)
-        if not resolved_url:
-            failed_rows.append(
-                {
-                    "title": title,
-                    "google_news_link": link,
-                    "reason": "URL resolve failed",
-                }
+            print(
+                "[SELENIUM] Chrome berhasil dijalankan."
             )
-            continue
+            print()
 
-        try:
-            full_text, summary = scrape_article(resolved_url)
-        except Exception as e:
-            failed_rows.append(
-                {
-                    "title": title,
-                    "google_news_link": link,
-                    "reason": f"Scrape failed: {e}",
-                }
+        for index, entry in enumerate(
+            entries,
+            1,
+        ):
+            title = entry.get(
+                "title",
+                "(no title)",
             )
-            continue
 
-        if not full_text or len(full_text.strip()) < 50:
-            failed_rows.append(
-                {
-                    "title": title,
-                    "google_news_link": link,
-                    "reason": "Empty content (no article body text found)",
-                }
+            google_news_link = entry.get(
+                "link",
+                "",
             )
-            print("    ✗ Skipped: No body content")
-            continue
 
-        row = build_success_row(entry, pub_dt, full_text, summary, resolved_url)
-        success_rows.append(row)
-        print("    ✓ Success")
+            print(
+                f"[{index}/{len(entries)}] "
+                f"{title[:100]}"
+            )
 
-        time.sleep(1)
+            # ------------------------------------------------------------
+            # Tanggal publikasi
+            # ------------------------------------------------------------
 
-    driver.quit()
+            try:
+                published_parsed = entry.get(
+                    "published_parsed",
+                )
 
-    # Merge with anything already written today (handles re-runs on the same
-    # day: manual dispatch + scheduled run, retries, etc.) and dedupe.
-    all_success = dedupe_success_rows(
-        load_existing_rows(SUCCESS_CSV, SUCCESS_FIELDS) + success_rows
+                if not published_parsed:
+                    raise ValueError(
+                        "published_parsed tidak tersedia"
+                    )
+
+                pub_dt = datetime(
+                    *published_parsed[:6],
+                )
+
+            except Exception as error:
+                failed_rows.append(
+                    {
+                        "title": title,
+                        "google_news_link": google_news_link,
+                        "reason": f"Date error: {error}",
+                    }
+                )
+
+                print(
+                    "    ✗ Gagal: tanggal tidak valid"
+                )
+
+                continue
+
+            # ------------------------------------------------------------
+            # Resolve URL
+            # ------------------------------------------------------------
+
+            if args.no_selenium:
+                resolved_url = google_news_link
+
+                print(
+                    "    [INFO] Selenium dinonaktifkan; "
+                    "menggunakan link RSS langsung."
+                )
+
+            else:
+                resolved_url = resolve_url(
+                    driver,
+                    google_news_link,
+                )
+
+            if not resolved_url:
+                failed_rows.append(
+                    {
+                        "title": title,
+                        "google_news_link": google_news_link,
+                        "reason": "URL resolve failed",
+                    }
+                )
+
+                print(
+                    "    ✗ Gagal: URL artikel tidak ditemukan"
+                )
+
+                continue
+
+            print(
+                f"    [URL] {resolved_url[:150]}"
+            )
+
+            # ------------------------------------------------------------
+            # Scrape artikel
+            # ------------------------------------------------------------
+
+            try:
+                full_text, summary = scrape_article(
+                    resolved_url,
+                )
+
+            except Exception as error:
+                failed_rows.append(
+                    {
+                        "title": title,
+                        "google_news_link": google_news_link,
+                        "reason": f"Scrape failed: {error}",
+                    }
+                )
+
+                print(
+                    f"    ✗ Scrape gagal: {error}"
+                )
+
+                continue
+
+            # ------------------------------------------------------------
+            # Validasi isi artikel
+            # ------------------------------------------------------------
+
+            if (
+                not full_text
+                or len(full_text.strip()) < 50
+            ):
+                failed_rows.append(
+                    {
+                        "title": title,
+                        "google_news_link": google_news_link,
+                        "reason": (
+                            "Empty 'how' "
+                            "(No article body text found)"
+                        ),
+                    }
+                )
+
+                print(
+                    "    ✗ Skipped: No body content"
+                )
+
+                continue
+
+            # ------------------------------------------------------------
+            # Build success row
+            # ------------------------------------------------------------
+
+            row = build_success_row(
+                entry,
+                pub_dt,
+                full_text,
+                summary,
+            )
+
+            success_rows.append(
+                row,
+            )
+
+            print(
+                "    ✓ Success"
+            )
+
+            if args.delay > 0:
+                time.sleep(
+                    args.delay,
+                )
+
+    except KeyboardInterrupt:
+        print(
+            "\n[STOP] Proses dihentikan oleh pengguna."
+        )
+
+    except Exception as error:
+        print(
+            f"\n[ERROR] Unexpected error: {error}"
+        )
+
+    finally:
+        if driver is not None:
+            try:
+                driver.quit()
+
+                print(
+                    "[SELENIUM] Chrome ditutup."
+                )
+
+            except Exception as error:
+                print(
+                    f"[WARNING] Gagal menutup Chrome: {error}"
+                )
+
+    # =========================================================================
+    # SAVE CSV
+    # =========================================================================
+
+    try:
+        write_csv(
+            success_csv,
+            SUCCESS_FIELDS,
+            success_rows,
+        )
+
+        write_csv(
+            failed_csv,
+            FAILED_FIELDS,
+            failed_rows,
+        )
+
+    except Exception as error:
+        print(
+            f"[ERROR] Gagal menyimpan CSV: {error}"
+        )
+
+        sys.exit(1)
+
+    # Tulis output untuk GitHub Actions (jika berjalan di sana)
+    write_github_output(
+        success_csv,
+        failed_csv,
     )
-    all_failed = dedupe_failed_rows(
-        load_existing_rows(FAILED_CSV, FAILED_FIELDS) + failed_rows
-    )
 
-    with open(SUCCESS_CSV, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=SUCCESS_FIELDS)
-        writer.writeheader()
-        writer.writerows(all_success)
-
-    with open(FAILED_CSV, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=FAILED_FIELDS)
-        writer.writeheader()
-        writer.writerows(all_failed)
-
+    print()
+    print("=" * 80)
+    print("SELESAI")
+    print("=" * 80)
     print(
-        f"\n✅ Finished this run! New success: {len(success_rows)} | New failed: {len(failed_rows)}"
+        f"Success : {len(success_rows)}"
     )
     print(
-        f"   Today's totals -> success: {len(all_success)} | failed: {len(all_failed)}"
+        f"Failed  : {len(failed_rows)}"
     )
-
-    # Emit paths so the GitHub Actions workflow can reference them if needed
-    # (e.g. to build the raw.githubusercontent.com URL in a job summary).
-    gh_output = os.environ.get("GITHUB_OUTPUT")
-    if gh_output:
-        with open(gh_output, "a", encoding="utf-8") as f:
-            f.write(f"success_csv={SUCCESS_CSV}\n")
-            f.write(f"failed_csv={FAILED_CSV}\n")
+    print(
+        f"Success CSV: {success_csv}"
+    )
+    print(
+        f"Failed CSV : {failed_csv}"
+    )
+    print("=" * 80)
 
 
 if __name__ == "__main__":
