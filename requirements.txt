@@ -1,6 +1,5 @@
 feedparser
-newspaper4k
-cloudscraper
+newspaper3k
 selenium
 nltk
 lxml_html_clean
