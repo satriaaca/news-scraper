@@ -1,21 +1,22 @@
 """
-Tabanan News RSS Scraper
+Tabanan News RSS Scraper (multi-thread)
 
 Fitur:
 - Mengambil berita dari Google News RSS
-- Selenium untuk resolve Google News redirect URL
+- Selenium untuk resolve Google News redirect URL (1 Chrome per worker thread)
 - newspaper4k/newspaper3k untuk mengambil isi berita
 - Membentuk data 5W1H
 - Menyimpan CSV success dan failed ke output/success/{date} dan output/failed/{date}
 - Mendukung testing lokal
 - Mendukung GitHub Actions (menulis GITHUB_OUTPUT: success_csv, failed_csv)
+- Pemrosesan paralel dengan ThreadPoolExecutor (--workers)
 
 Contoh penggunaan:
 
     python scraper.py
-    python scraper.py --max-results 1
-    python scraper.py --max-results 5 --show-browser
-    python scraper.py --no-selenium
+    python scraper.py --workers 6
+    python scraper.py --max-results 5 --show-browser --workers 1
+    python scraper.py --no-selenium --workers 8
     python scraper.py --rss "https://news.google.com/rss/search?q=Tabanan"
 """
 
@@ -26,7 +27,9 @@ import csv
 import os
 import re
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Optional, Tuple
 
@@ -38,6 +41,7 @@ from newspaper import network as newspaper_network
 
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
 
 
 # ============================================================================
@@ -50,6 +54,7 @@ DEFAULT_RSS_URL = (
 )
 
 DEFAULT_MAX_RESULTS = 40
+DEFAULT_WORKERS = 4
 
 ID_DAYS = {
     0: "Senin",
@@ -112,6 +117,13 @@ FAILED_FIELDS = [
     "reason",
 ]
 
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 "
+    "(KHTML, like Gecko) "
+    "Chrome/128.0.0.0 Safari/537.36"
+)
+
 
 # ============================================================================
 # NLTK
@@ -120,14 +132,10 @@ FAILED_FIELDS = [
 def prepare_nltk() -> None:
     """
     Mengunduh resource NLTK yang diperlukan oleh newspaper.
+    Dipanggil sekali di thread utama sebelum worker dimulai.
     """
 
-    packages = [
-        "punkt",
-        "punkt_tab",
-    ]
-
-    for package in packages:
+    for package in ("punkt", "punkt_tab"):
         try:
             nltk.download(package, quiet=True)
         except Exception as error:
@@ -149,49 +157,25 @@ def split_sentences(text: str) -> list[str]:
     if not text:
         return []
 
-    parts = re.split(
-        r"(?<=[.!?])\s+",
-        text.strip(),
-    )
+    parts = re.split(r"(?<=[.!?])\s+", text.strip())
 
-    return [
-        part.strip()
-        for part in parts
-        if part.strip()
-    ]
+    return [part.strip() for part in parts if part.strip()]
 
 
-def get_sentences(
-    text: str,
-    start: int,
-    end: int,
-) -> str:
+def get_sentences(text: str, start: int, end: int) -> str:
     """
     Mengambil kalimat dari index start sampai end.
     """
 
-    sentences = split_sentences(text)
-
-    return " ".join(
-        sentences[start:end]
-    )
+    return " ".join(split_sentences(text)[start:end])
 
 
 def extract_source_from_title(title: str) -> str:
     """
     Mengambil nama media dari bagian akhir judul Google News.
-
-    Contoh:
-        "Berita Tabanan Hari Ini - Bali Post"
-
-    Hasil:
-        "Bali Post"
     """
 
-    match = re.search(
-        r"-\s*([^-]+)$",
-        title,
-    )
+    match = re.search(r"-\s*([^-]+)$", title)
 
     if match:
         return match.group(1).strip()
@@ -214,11 +198,7 @@ def clean_title(title: str) -> str:
     if "-" in title:
         title = title.rsplit("-", 1)[0]
 
-    title = re.sub(
-        r"[^a-zA-Z0-9\s]",
-        "",
-        title,
-    )
+    title = re.sub(r"[^a-zA-Z0-9\s]", "", title)
 
     return " ".join(title.split())
 
@@ -245,27 +225,16 @@ def format_date_iso(pub_dt: datetime) -> str:
         2026-09-16T10:20:30.123Z
     """
 
-    return (
-        pub_dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
-        + "Z"
-    )
+    return pub_dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
 # ============================================================================
-# SELENIUM
+# SELENIUM (satu driver per thread)
 # ============================================================================
 
-def make_driver(
-    show_browser: bool = False,
-) -> webdriver.Chrome:
+def make_driver(show_browser: bool = False) -> webdriver.Chrome:
     """
     Membuat Chrome WebDriver.
-
-    show_browser=False:
-        Chrome berjalan headless.
-
-    show_browser=True:
-        Chrome tampil secara normal untuk debugging lokal.
     """
 
     options = Options()
@@ -278,23 +247,14 @@ def make_driver(
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1920,1080")
     options.add_argument("--lang=id-ID")
+    options.add_argument(f"--user-agent={USER_AGENT}")
 
-    # User-Agent agar lebih menyerupai browser biasa.
-    options.add_argument(
-        "--user-agent="
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 "
-        "(KHTML, like Gecko) "
-        "Chrome/128.0.0.0 Safari/537.36"
-    )
+    # Percepat: tidak perlu menunggu semua resource selesai dimuat.
+    options.page_load_strategy = "eager"
 
     try:
-        driver = webdriver.Chrome(
-            options=options,
-        )
-
+        driver = webdriver.Chrome(options=options)
         driver.set_page_load_timeout(30)
-
         return driver
 
     except Exception as error:
@@ -305,14 +265,53 @@ def make_driver(
         ) from error
 
 
+class DriverPool:
+    """
+    Menyediakan satu WebDriver untuk setiap thread (WebDriver tidak
+    thread-safe) dan menutup semuanya di akhir proses.
+    """
+
+    def __init__(self, show_browser: bool) -> None:
+        self.show_browser = show_browser
+        self._local = threading.local()
+        self._all: list[webdriver.Chrome] = []
+        self._lock = threading.Lock()
+
+    def get(self) -> webdriver.Chrome:
+        driver = getattr(self._local, "driver", None)
+
+        if driver is None:
+            driver = make_driver(show_browser=self.show_browser)
+            self._local.driver = driver
+
+            with self._lock:
+                self._all.append(driver)
+
+        return driver
+
+    def close_all(self) -> None:
+        with self._lock:
+            drivers, self._all = self._all, []
+
+        for driver in drivers:
+            try:
+                driver.quit()
+            except Exception as error:
+                print(f"[WARNING] Gagal menutup Chrome: {error}")
+
+        if drivers:
+            print(f"[SELENIUM] {len(drivers)} Chrome ditutup.")
+
+
 def resolve_url(
     driver: webdriver.Chrome,
     google_url: str,
-    wait_seconds: float = 2.0,
+    timeout: float = 10.0,
 ) -> Optional[str]:
     """
-    Membuka URL Google News menggunakan Selenium,
-    lalu mengambil URL artikel tujuan.
+    Membuka URL Google News dengan Selenium lalu menunggu sampai
+    redirect ke URL artikel tujuan selesai (bukan sleep tetap),
+    sehingga lebih cepat.
     """
 
     if not google_url:
@@ -321,24 +320,21 @@ def resolve_url(
     try:
         driver.get(google_url)
 
-        time.sleep(wait_seconds)
+        try:
+            WebDriverWait(driver, timeout, poll_frequency=0.25).until(
+                lambda d: "google.com" not in d.current_url.lower()
+            )
+        except Exception:
+            return None
 
         real_url = driver.current_url.strip()
 
-        if not real_url:
-            return None
-
-        # Jika masih berada di Google News, dianggap gagal.
-        if "google.com" in real_url.lower():
+        if not real_url or "google.com" in real_url.lower():
             return None
 
         return real_url
 
-    except Exception as error:
-        print(
-            f"    [WARNING] URL resolve error: {error}"
-        )
-
+    except Exception:
         return None
 
 
@@ -346,33 +342,24 @@ def resolve_url(
 # ARTICLE SCRAPER
 # ============================================================================
 
-def scrape_article(
-    url: str,
-) -> Tuple[str, str]:
+def scrape_article(url: str) -> Tuple[str, str]:
     """
     Mengambil isi artikel dan ringkasannya menggunakan newspaper.
     """
 
-    article = Article(
-        url,
-        language="id",
-    )
+    article = Article(url, language="id")
 
     article.download()
     article.parse()
 
-    # NLP digunakan untuk menghasilkan summary.
     try:
         article.nlp()
     except Exception:
         pass
 
-    full_text = article.text or ""
-    summary = article.summary or ""
-
     return (
-        full_text.strip(),
-        summary.strip(),
+        (article.text or "").strip(),
+        (article.summary or "").strip(),
     )
 
 
@@ -387,45 +374,20 @@ def create_output_paths() -> Tuple[str, str]:
         output/success/{YYYY-MM-DD}.csv
         output/failed/{YYYY-MM-DD}.csv
 
-    Jika file untuk tanggal yang sama sudah ada, file tersebut
-    akan ditimpa (replace) oleh run berikutnya di hari yang sama.
+    File untuk tanggal yang sama akan ditimpa oleh run berikutnya.
     """
 
     today = datetime.now().strftime("%Y-%m-%d")
 
-    success_dir = os.path.join(
-        "output",
-        "success",
-    )
+    success_dir = os.path.join("output", "success")
+    failed_dir = os.path.join("output", "failed")
 
-    failed_dir = os.path.join(
-        "output",
-        "failed",
-    )
-
-    os.makedirs(
-        success_dir,
-        exist_ok=True,
-    )
-
-    os.makedirs(
-        failed_dir,
-        exist_ok=True,
-    )
-
-    success_csv = os.path.join(
-        success_dir,
-        f"{today}.csv",
-    )
-
-    failed_csv = os.path.join(
-        failed_dir,
-        f"{today}.csv",
-    )
+    os.makedirs(success_dir, exist_ok=True)
+    os.makedirs(failed_dir, exist_ok=True)
 
     return (
-        success_csv,
-        failed_csv,
+        os.path.join(success_dir, f"{today}.csv"),
+        os.path.join(failed_dir, f"{today}.csv"),
     )
 
 
@@ -454,13 +416,9 @@ def write_csv(
         writer.writerows(rows)
 
 
-def write_github_output(
-    success_csv: str,
-    failed_csv: str,
-) -> None:
+def write_github_output(success_csv: str, failed_csv: str) -> None:
     """
-    Menulis path CSV ke file GITHUB_OUTPUT (jika berjalan di GitHub Actions)
-    supaya bisa dipakai oleh step berikutnya, misalnya:
+    Menulis path CSV ke file GITHUB_OUTPUT (jika berjalan di GitHub Actions):
 
         ${{ steps.scrape.outputs.success_csv }}
         ${{ steps.scrape.outputs.failed_csv }}
@@ -472,22 +430,15 @@ def write_github_output(
         return
 
     try:
-        # Gunakan forward slash agar konsisten dengan URL raw.githubusercontent.com
         success_posix = success_csv.replace(os.sep, "/")
         failed_posix = failed_csv.replace(os.sep, "/")
 
-        with open(
-            github_output,
-            "a",
-            encoding="utf-8",
-        ) as file:
+        with open(github_output, "a", encoding="utf-8") as file:
             file.write(f"success_csv={success_posix}\n")
             file.write(f"failed_csv={failed_posix}\n")
 
     except Exception as error:
-        print(
-            f"[WARNING] Gagal menulis GITHUB_OUTPUT: {error}"
-        )
+        print(f"[WARNING] Gagal menulis GITHUB_OUTPUT: {error}")
 
 
 # ============================================================================
@@ -504,38 +455,14 @@ def build_success_row(
     Membentuk satu baris data success.
     """
 
-    original_title = entry.get(
-        "title",
-        "(no title)",
-    )
+    original_title = entry.get("title", "(no title)")
+    cleaned_title = clean_title(original_title)
 
-    cleaned_title = clean_title(
-        original_title,
-    )
+    what = get_sentences(full_text, 0, 2).strip() or summary.strip()
+    why = get_sentences(full_text, 2, 4)
 
-    what = (
-        get_sentences(
-            full_text,
-            0,
-            2,
-        ).strip()
-        or summary.strip()
-    )
-
-    why = get_sentences(
-        full_text,
-        2,
-        4,
-    )
-
-    prefix = format_how_prefix(
-        pub_dt,
-    )
-
-    how = (
-        f"{prefix}\n\n"
-        f"{full_text.strip()}"
-    )
+    prefix = format_how_prefix(pub_dt)
+    how = f"{prefix}\n\n{full_text.strip()}"
 
     return {
         "title": cleaned_title,
@@ -545,18 +472,114 @@ def build_success_row(
         "what": what,
         "why": why,
         "how": how,
-        "source_agent_report": extract_source_from_title(
-            original_title,
-        ),
+        "source_agent_report": extract_source_from_title(original_title),
         "location_name": FIXED["location_name"],
         "latitude": FIXED["latitude"],
         "longitude": FIXED["longitude"],
         "category": FIXED["category"],
-        "data_of_information": FIXED[
-            "data_of_information"
-        ],
+        "data_of_information": FIXED["data_of_information"],
         "hashtags": FIXED["hashtags"],
     }
+
+
+# ============================================================================
+# WORKER
+# ============================================================================
+
+print_lock = threading.Lock()
+
+
+def log(lines: list[str]) -> None:
+    """
+    Mencetak beberapa baris sekaligus agar log antar thread tidak tercampur.
+    """
+
+    with print_lock:
+        print("\n".join(lines), flush=True)
+
+
+def process_entry(
+    index: int,
+    total: int,
+    entry,
+    args,
+    pool: Optional[DriverPool],
+) -> Tuple[str, dict]:
+    """
+    Memproses satu artikel. Mengembalikan ("success" | "failed", row).
+    Dijalankan di worker thread.
+    """
+
+    title = entry.get("title", "(no title)")
+    google_news_link = entry.get("link", "")
+
+    lines = [f"[{index}/{total}] {title[:100]}"]
+
+    def fail(reason: str, message: str) -> Tuple[str, dict]:
+        lines.append(f"    ✗ {message}")
+        log(lines)
+
+        return (
+            "failed",
+            {
+                "title": title,
+                "google_news_link": google_news_link,
+                "reason": reason,
+            },
+        )
+
+    # ---- Tanggal publikasi ------------------------------------------------
+    try:
+        published_parsed = entry.get("published_parsed")
+
+        if not published_parsed:
+            raise ValueError("published_parsed tidak tersedia")
+
+        pub_dt = datetime(*published_parsed[:6])
+
+    except Exception as error:
+        return fail(f"Date error: {error}", "Gagal: tanggal tidak valid")
+
+    # ---- Resolve URL ------------------------------------------------------
+    if args.no_selenium:
+        resolved_url = google_news_link
+    else:
+        try:
+            resolved_url = resolve_url(pool.get(), google_news_link)
+        except Exception as error:
+            return fail(
+                f"Driver error: {error}",
+                f"Gagal: driver error ({error})",
+            )
+
+    if not resolved_url:
+        return fail("URL resolve failed", "Gagal: URL artikel tidak ditemukan")
+
+    lines.append(f"    [URL] {resolved_url[:150]}")
+
+    # ---- Scrape artikel ---------------------------------------------------
+    try:
+        full_text, summary = scrape_article(resolved_url)
+    except Exception as error:
+        return fail(f"Scrape failed: {error}", f"Scrape gagal: {error}")
+
+    if not full_text or len(full_text.strip()) < 50:
+        return fail(
+            "Empty 'how' (No article body text found)",
+            "Skipped: No body content",
+        )
+
+    # ---- Build row --------------------------------------------------------
+    row = build_success_row(entry, pub_dt, full_text, summary)
+
+    lines.append("    ✓ Success")
+    log(lines)
+
+    # Jeda per worker (sopan terhadap server target).
+    if args.delay > 0:
+        time.sleep(args.delay)
+
+    return "success", row
 
 
 # ============================================================================
@@ -564,12 +587,8 @@ def build_success_row(
 # ============================================================================
 
 def parse_arguments():
-    """
-    Membaca argument command line.
-    """
-
     parser = argparse.ArgumentParser(
-        description="Tabanan News RSS Scraper",
+        description="Tabanan News RSS Scraper (multi-thread)",
     )
 
     parser.add_argument(
@@ -583,6 +602,17 @@ def parse_arguments():
         type=int,
         default=DEFAULT_MAX_RESULTS,
         help="Jumlah maksimal artikel yang diproses",
+    )
+
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=DEFAULT_WORKERS,
+        help=(
+            "Jumlah thread paralel "
+            f"(default {DEFAULT_WORKERS}). Setiap thread membuka 1 Chrome "
+            "jika Selenium aktif."
+        ),
     )
 
     parser.add_argument(
@@ -604,7 +634,7 @@ def parse_arguments():
         "--delay",
         type=float,
         default=1.0,
-        help="Jeda antarartikel dalam detik",
+        help="Jeda per worker setelah tiap artikel, dalam detik",
     )
 
     return parser.parse_args()
@@ -618,35 +648,37 @@ def main() -> None:
     args = parse_arguments()
 
     if args.max_results < 1:
-        print(
-            "[ERROR] --max-results harus lebih besar dari 0."
-        )
+        print("[ERROR] --max-results harus lebih besar dari 0.")
+        sys.exit(1)
 
+    if args.workers < 1:
+        print("[ERROR] --workers harus lebih besar dari 0.")
         sys.exit(1)
 
     if args.delay < 0:
-        print(
-            "[ERROR] --delay tidak boleh negatif."
-        )
-
+        print("[ERROR] --delay tidak boleh negatif.")
         sys.exit(1)
+
+    # Mode tampil browser lebih nyaman dengan 1 worker.
+    if args.show_browser and args.workers > 1:
+        print(
+            "[INFO] --show-browser aktif: "
+            "jumlah worker tetap sesuai --workers "
+            f"({args.workers} jendela Chrome)."
+        )
 
     prepare_nltk()
 
-    newspaper_network.USER_AGENT = (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 "
-        "(KHTML, like Gecko) "
-        "Chrome/128.0.0.0 Safari/537.36"
-    )
+    newspaper_network.USER_AGENT = USER_AGENT
 
     success_csv, failed_csv = create_output_paths()
 
     print("=" * 80)
-    print("TABANAN NEWS RSS SCRAPER")
+    print("TABANAN NEWS RSS SCRAPER (MULTI-THREAD)")
     print("=" * 80)
     print(f"[CONFIG] RSS URL       : {args.rss}")
     print(f"[CONFIG] Max results   : {args.max_results}")
+    print(f"[CONFIG] Workers       : {args.workers}")
     print(f"[CONFIG] Selenium      : {not args.no_selenium}")
     print(f"[CONFIG] Show browser  : {args.show_browser}")
     print(f"[CONFIG] Delay         : {args.delay} detik")
@@ -655,14 +687,9 @@ def main() -> None:
     print(f"[RSS] Fetching: {args.rss}")
 
     try:
-        feed = feedparser.parse(
-            args.rss,
-        )
+        feed = feedparser.parse(args.rss)
     except Exception as error:
-        print(
-            f"[ERROR] RSS gagal diproses: {error}"
-        )
-
+        print(f"[ERROR] RSS gagal diproses: {error}")
         sys.exit(1)
 
     if getattr(feed, "bozo", False):
@@ -672,275 +699,105 @@ def main() -> None:
         )
 
         if getattr(feed, "bozo_exception", None):
-            print(
-                f"[WARNING] Detail RSS: "
-                f"{feed.bozo_exception}"
-            )
+            print(f"[WARNING] Detail RSS: {feed.bozo_exception}")
 
-    entries = feed.entries[:args.max_results]
+    entries = feed.entries[: args.max_results]
 
     if not entries:
-        print(
-            "[ERROR] Tidak ada artikel ditemukan dari RSS."
-        )
-
+        print("[ERROR] Tidak ada artikel ditemukan dari RSS.")
         sys.exit(1)
 
-    print(
-        f"[RSS] Processing {len(entries)} articles."
-    )
+    total = len(entries)
+    workers = min(args.workers, total)
+
+    print(f"[RSS] Processing {total} articles with {workers} workers.")
     print()
 
-    driver = None
+    pool = None if args.no_selenium else DriverPool(args.show_browser)
 
-    success_rows = []
-    failed_rows = []
+    # Hasil disimpan per index agar urutan CSV sama dengan urutan RSS.
+    results: dict[int, Tuple[str, dict]] = {}
+
+    executor = ThreadPoolExecutor(
+        max_workers=workers,
+        thread_name_prefix="scraper",
+    )
 
     try:
-        if not args.no_selenium:
-            print("[SELENIUM] Starting Chrome...")
-
-            driver = make_driver(
-                show_browser=args.show_browser,
-            )
-
-            print(
-                "[SELENIUM] Chrome berhasil dijalankan."
-            )
-            print()
-
-        for index, entry in enumerate(
-            entries,
-            1,
-        ):
-            title = entry.get(
-                "title",
-                "(no title)",
-            )
-
-            google_news_link = entry.get(
-                "link",
-                "",
-            )
-
-            print(
-                f"[{index}/{len(entries)}] "
-                f"{title[:100]}"
-            )
-
-            # ------------------------------------------------------------
-            # Tanggal publikasi
-            # ------------------------------------------------------------
-
-            try:
-                published_parsed = entry.get(
-                    "published_parsed",
-                )
-
-                if not published_parsed:
-                    raise ValueError(
-                        "published_parsed tidak tersedia"
-                    )
-
-                pub_dt = datetime(
-                    *published_parsed[:6],
-                )
-
-            except Exception as error:
-                failed_rows.append(
-                    {
-                        "title": title,
-                        "google_news_link": google_news_link,
-                        "reason": f"Date error: {error}",
-                    }
-                )
-
-                print(
-                    "    ✗ Gagal: tanggal tidak valid"
-                )
-
-                continue
-
-            # ------------------------------------------------------------
-            # Resolve URL
-            # ------------------------------------------------------------
-
-            if args.no_selenium:
-                resolved_url = google_news_link
-
-                print(
-                    "    [INFO] Selenium dinonaktifkan; "
-                    "menggunakan link RSS langsung."
-                )
-
-            else:
-                resolved_url = resolve_url(
-                    driver,
-                    google_news_link,
-                )
-
-            if not resolved_url:
-                failed_rows.append(
-                    {
-                        "title": title,
-                        "google_news_link": google_news_link,
-                        "reason": "URL resolve failed",
-                    }
-                )
-
-                print(
-                    "    ✗ Gagal: URL artikel tidak ditemukan"
-                )
-
-                continue
-
-            print(
-                f"    [URL] {resolved_url[:150]}"
-            )
-
-            # ------------------------------------------------------------
-            # Scrape artikel
-            # ------------------------------------------------------------
-
-            try:
-                full_text, summary = scrape_article(
-                    resolved_url,
-                )
-
-            except Exception as error:
-                failed_rows.append(
-                    {
-                        "title": title,
-                        "google_news_link": google_news_link,
-                        "reason": f"Scrape failed: {error}",
-                    }
-                )
-
-                print(
-                    f"    ✗ Scrape gagal: {error}"
-                )
-
-                continue
-
-            # ------------------------------------------------------------
-            # Validasi isi artikel
-            # ------------------------------------------------------------
-
-            if (
-                not full_text
-                or len(full_text.strip()) < 50
-            ):
-                failed_rows.append(
-                    {
-                        "title": title,
-                        "google_news_link": google_news_link,
-                        "reason": (
-                            "Empty 'how' "
-                            "(No article body text found)"
-                        ),
-                    }
-                )
-
-                print(
-                    "    ✗ Skipped: No body content"
-                )
-
-                continue
-
-            # ------------------------------------------------------------
-            # Build success row
-            # ------------------------------------------------------------
-
-            row = build_success_row(
+        futures = {
+            executor.submit(
+                process_entry,
+                index,
+                total,
                 entry,
-                pub_dt,
-                full_text,
-                summary,
-            )
+                args,
+                pool,
+            ): index
+            for index, entry in enumerate(entries, 1)
+        }
 
-            success_rows.append(
-                row,
-            )
+        for future in as_completed(futures):
+            index = futures[future]
 
-            print(
-                "    ✓ Success"
-            )
+            try:
+                results[index] = future.result()
+            except Exception as error:
+                entry = entries[index - 1]
 
-            if args.delay > 0:
-                time.sleep(
-                    args.delay,
+                results[index] = (
+                    "failed",
+                    {
+                        "title": entry.get("title", "(no title)"),
+                        "google_news_link": entry.get("link", ""),
+                        "reason": f"Unexpected error: {error}",
+                    },
                 )
+
+                log([f"[{index}/{total}] ✗ Unexpected error: {error}"])
 
     except KeyboardInterrupt:
-        print(
-            "\n[STOP] Proses dihentikan oleh pengguna."
-        )
+        print("\n[STOP] Proses dihentikan oleh pengguna.")
+        executor.shutdown(wait=False, cancel_futures=True)
 
     except Exception as error:
-        print(
-            f"\n[ERROR] Unexpected error: {error}"
-        )
+        print(f"\n[ERROR] Unexpected error: {error}")
+        executor.shutdown(wait=False, cancel_futures=True)
 
     finally:
-        if driver is not None:
-            try:
-                driver.quit()
+        executor.shutdown(wait=True, cancel_futures=True)
 
-                print(
-                    "[SELENIUM] Chrome ditutup."
-                )
+        if pool is not None:
+            pool.close_all()
 
-            except Exception as error:
-                print(
-                    f"[WARNING] Gagal menutup Chrome: {error}"
-                )
+    success_rows = [
+        results[i][1] for i in sorted(results) if results[i][0] == "success"
+    ]
+    failed_rows = [
+        results[i][1] for i in sorted(results) if results[i][0] == "failed"
+    ]
 
     # =========================================================================
     # SAVE CSV
     # =========================================================================
 
     try:
-        write_csv(
-            success_csv,
-            SUCCESS_FIELDS,
-            success_rows,
-        )
-
-        write_csv(
-            failed_csv,
-            FAILED_FIELDS,
-            failed_rows,
-        )
+        write_csv(success_csv, SUCCESS_FIELDS, success_rows)
+        write_csv(failed_csv, FAILED_FIELDS, failed_rows)
 
     except Exception as error:
-        print(
-            f"[ERROR] Gagal menyimpan CSV: {error}"
-        )
-
+        print(f"[ERROR] Gagal menyimpan CSV: {error}")
         sys.exit(1)
 
-    # Tulis output untuk GitHub Actions (jika berjalan di sana)
-    write_github_output(
-        success_csv,
-        failed_csv,
-    )
+    write_github_output(success_csv, failed_csv)
 
     print()
     print("=" * 80)
     print("SELESAI")
     print("=" * 80)
-    print(
-        f"Success : {len(success_rows)}"
-    )
-    print(
-        f"Failed  : {len(failed_rows)}"
-    )
-    print(
-        f"Success CSV: {success_csv}"
-    )
-    print(
-        f"Failed CSV : {failed_csv}"
-    )
+    print(f"Success : {len(success_rows)}")
+    print(f"Failed  : {len(failed_rows)}")
+    print(f"Success CSV: {success_csv}")
+    print(f"Failed CSV : {failed_csv}")
     print("=" * 80)
 
 
